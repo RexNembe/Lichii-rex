@@ -11,12 +11,15 @@
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
 #include "common/atomic_ops.h"
@@ -37,9 +40,12 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_oot_readback_trace.h"
 #include "video_core/rasterizer_download_area.h"
 
 namespace Core::Memory {
+
+namespace OotReadbackTrace = VideoCommon::Nx2OotReadbackTrace;
 
 u32& UnmappedReadFlag() {
     thread_local u32 flag{};
@@ -56,6 +62,25 @@ static inline bool AddressSpaceContains(const Common::PageTable& table, const Co
 // subsystem without needing to rebuild all files that make use of the memory interface.
 struct Memory::Impl {
     explicit Impl(Core::System& system_) : system{system_} {}
+
+    struct ReadbackObservation {
+        void AddAddress(DAddr address, size_t size) {
+            if (OotReadbackTrace::Watches(address, size)) {
+                addresses.push_back(address);
+            }
+        }
+
+        void Record(VAddr address, std::span<const u8> bytes) const {
+            for (const DAddr device_address : addresses) {
+                OotReadbackTrace::Record(OotReadbackTrace::Event::GuestRead, device_address,
+                                         bytes.size(), bytes, address & 0xffffffffffffULL);
+            }
+        }
+
+        // Keep the aliases from the existing download lookup. Looking them up again after the
+        // load could attribute the bytes to a mapping created in the meantime.
+        boost::container::small_vector<DAddr, 2> addresses;
+    };
 
     void SetCurrentPageTable(Kernel::KProcess& process) {
         current_page_table = &process.GetPageTable().GetImpl();
@@ -175,8 +200,13 @@ struct Memory::Impl {
         if (!current_page_table || (addr & 3) != 0) {
             return false;
         }
+        std::optional<ReadbackObservation> readback;
         auto* pointer = GetPointerImpl(GetInteger(addr), [] {}, [&] {
-            HandleRasterizerDownload(GetInteger(addr), sizeof(u32));
+            if (OotReadbackTrace::Enabled()) {
+                readback.emplace();
+            }
+            HandleRasterizerDownload(GetInteger(addr), sizeof(u32),
+                                     readback ? &*readback : nullptr);
         });
         if (!pointer) {
             return false;
@@ -184,6 +214,10 @@ struct Memory::Impl {
         u32_le actual{};
         static_cast<void>(Common::AtomicCompareAndSwap(reinterpret_cast<u32_le*>(pointer),
                                                      u32_le{0}, u32_le{0}, actual));
+        if (readback) {
+            readback->Record(GetInteger(addr),
+                             {reinterpret_cast<const u8*>(&actual), sizeof(actual)});
+        }
         value = actual;
         return true;
     }
@@ -319,10 +353,19 @@ struct Memory::Impl {
             std::memcpy(reinterpret_cast<u8*>(buffer) + offset, ptr, copy_amount);
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, const u8* const ptr) {
+            std::optional<ReadbackObservation> readback;
             if (!unsafe) {
-                HandleRasterizerDownload(GetInteger(current_vaddr), copy_amount);
+                if (OotReadbackTrace::Enabled()) {
+                    readback.emplace();
+                }
+                HandleRasterizerDownload(GetInteger(current_vaddr), copy_amount,
+                                         readback ? &*readback : nullptr);
             }
-            std::memcpy(reinterpret_cast<u8*>(buffer) + offset, ptr, copy_amount);
+            auto* const destination = reinterpret_cast<u8*>(buffer) + offset;
+            std::memcpy(destination, ptr, copy_amount);
+            if (readback) {
+                readback->Record(GetInteger(current_vaddr), {destination, copy_amount});
+            }
         });
     }
 
@@ -799,6 +842,7 @@ struct Memory::Impl {
     template <typename T>
     inline T Read(Common::ProcessAddress vaddr) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
+        std::optional<ReadbackObservation> readback;
         if (auto const ptr = GetPointerImpl(addr, [addr]() {
             // A guest spinning on a bad pointer reads unmapped memory tens of thousands of times
             // a second: keep the first ones and then a sample.
@@ -809,7 +853,10 @@ struct Memory::Impl {
             ++UnmappedReadFlag();
         }, [&]() {
             if (!ReadTrapsEnabled() || ReadTrapArmed(addr & 0xffffffffffffULL, sizeof(T))) {
-                HandleRasterizerDownload(addr, sizeof(T));
+                if (OotReadbackTrace::Enabled()) {
+                    readback.emplace();
+                }
+                HandleRasterizerDownload(addr, sizeof(T), readback ? &*readback : nullptr);
             }
         }); ptr) [[likely]] {
             // It may be tempting to rewrite this particular section to use "reinterpret_cast";
@@ -817,6 +864,9 @@ struct Memory::Impl {
             // Remember, alignment. memcpy() will deal with all the alignment extremely fast.
             T result{};
             std::memcpy(&result, ptr, sizeof(T));
+            if (readback) {
+                readback->Record(addr, {reinterpret_cast<const u8*>(&result), sizeof(result)});
+            }
             return result;
         }
         return T{};
@@ -880,7 +930,8 @@ struct Memory::Impl {
                   static_cast<u32>(raw.type), static_cast<u32>(raw.block));
     }
 
-    void HandleRasterizerDownload(VAddr v_address, size_t size) {
+    void HandleRasterizerDownload(VAddr v_address, size_t size,
+                                  ReadbackObservation* readback = nullptr) {
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
         if (!gpu_device_memory) [[unlikely]] {
@@ -899,6 +950,9 @@ struct Memory::Impl {
             }
             Common::ScratchBuffer<u32> scratch;
             gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
+                if (readback) {
+                    readback->AddAddress(address, size);
+                }
                 DisarmReadTraps(v_address, size);
                 (void)system.GPU().OnCPURead(address, size);
             });
@@ -911,9 +965,16 @@ struct Memory::Impl {
             read_area_generations[core] = generation;
         }
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            if (readback) {
+                readback->AddAddress(address, size);
+            }
             const DAddr end_address = address + size;
             if (current_area.start_address <= address && end_address <= current_area.end_address)
                 [[likely]] {
+                if (OotReadbackTrace::Watches(address, size)) [[unlikely]] {
+                    OotReadbackTrace::Record(OotReadbackTrace::Event::ReusedArea, address, size, {},
+                                             read_area_generations[core]);
+                }
                 return;
             }
             DisarmReadTraps(v_address, size);

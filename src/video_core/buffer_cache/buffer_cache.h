@@ -25,6 +25,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_oot_readback_trace.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/texture_cache/util.h"
@@ -277,6 +278,7 @@ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
 template <class P>
 std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DAddr device_addr,
                                                                               u64 size) {
+    namespace Trace = Nx2OotReadbackTrace;
     std::optional<VideoCore::RasterizerDownloadArea> area{};
     area.emplace();
     DAddr device_addr_start_aligned = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
@@ -285,6 +287,9 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     area->end_address = device_addr_end_aligned;
     if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
         area->preemtive = true;
+        if (Trace::Watches(device_addr, size)) [[unlikely]] {
+            Trace::Record(Trace::Event::Preemptive, device_addr, size, {}, 1);
+        }
         return area;
     };
     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
@@ -315,6 +320,9 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
         // again, which ends the area and sets the trap.
         read_trapped_ranges.Subtract(device_addr_start_aligned,
                                      device_addr_end_aligned - device_addr_start_aligned);
+        if (Trace::Watches(device_addr, size)) [[unlikely]] {
+            Trace::Record(Trace::Event::Preemptive, device_addr, size, {}, 2);
+        }
     }
     return area;
 }
@@ -1107,17 +1115,31 @@ Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
 template <class P>
 void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
                                            DAddr device_addr, const u8* data, u64 size) {
+    namespace Trace = Nx2OotReadbackTrace;
+    const bool trace = Trace::Watches(device_addr, size);
+    const auto publish = [&](DAddr start, const u8* source, u64 length) {
+        device_memory.WriteBlockUnsafe(start, source, length);
+        if (trace && Trace::Watches(start, length)) [[unlikely]] {
+            Trace::Record(Trace::Event::Download, start, length,
+                          {source, static_cast<size_t>(length)});
+        }
+    };
     if (!cpu_written.Intersects(device_addr, size)) {
-        device_memory.WriteBlockUnsafe(device_addr, data, size);
+        publish(device_addr, data, size);
         return;
     }
     Common::RangeSet<DAddr> parts;
     parts.Add(device_addr, size);
-    cpu_written.ForEachInRange(device_addr, size, [&parts](DAddr start, DAddr end) {
-        parts.Subtract(start, end - start);
+    cpu_written.ForEachInRange(device_addr, size, [&](DAddr start, DAddr end) {
+        const u64 length = end - start;
+        parts.Subtract(start, length);
+        if (trace && Trace::Watches(start, length)) [[unlikely]] {
+            Trace::Record(Trace::Event::Excluded, start, length,
+                          {data + (start - device_addr), static_cast<size_t>(length)});
+        }
     });
     parts.ForEach([&](DAddr start, DAddr end) {
-        device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
+        publish(start, data + (start - device_addr), end - start);
     });
 }
 
@@ -2154,6 +2176,9 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     MarkVertexBuffersStale(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
     QueueFenceDownload(device_addr, size);
+    if (Nx2OotReadbackTrace::Watches(device_addr, size)) [[unlikely]] {
+        Nx2OotReadbackTrace::Record(Nx2OotReadbackTrace::Event::GpuMarked, device_addr, size);
+    }
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
         Tegra::Nx2MarkGpuWritten(device_addr, size);
         Nx2NoteListWrite(buffer_id, device_addr, size);

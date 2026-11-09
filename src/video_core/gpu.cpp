@@ -40,6 +40,7 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_oot_readback_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
@@ -183,6 +184,9 @@ struct GPU::Impl {
                              Settings::values.gpu_clock.GetValue()),
             std::memory_order_relaxed);
         system.GetPerfStats().EndGameFrame();
+        if (VideoCommon::Nx2OotReadbackTrace::Enabled()) [[unlikely]] {
+            VideoCommon::Nx2OotReadbackTrace::Poll();
+        }
     }
 
     /// Performs any additional setup necessary in order to begin GPU emulation.
@@ -242,8 +246,13 @@ struct GPU::Impl {
     }
 
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
+        namespace Trace = VideoCommon::Nx2OotReadbackTrace;
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
+        const bool trace = Trace::Watches(addr, size);
         if (raster_area.preemtive) {
+            if (trace) [[unlikely]] {
+                Trace::Record(Trace::Event::Preemptive, addr, size);
+            }
             return raster_area;
         }
         raster_area.preemtive = true;
@@ -254,6 +263,12 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
+        u64 trace_id{};
+        if (trace) [[unlikely]] {
+            static std::atomic<u64> next_trace_id{1};
+            trace_id = next_trace_id.fetch_add(1, std::memory_order_relaxed);
+            Trace::Record(Trace::Event::FlushRequested, addr, size, {}, trace_id);
+        }
         const u64 fence = RequestSyncOperation([this, raster_area]() {
             // Apply collected guest writes before downloading GPU data over guest memory.
             InvalidateGPUCache();
@@ -261,6 +276,9 @@ struct GPU::Impl {
         });
         gpu_thread.TickGPU(is_async);
         WaitForSyncOperation(fence);
+        if (trace) [[unlikely]] {
+            Trace::Record(Trace::Event::FlushFinished, addr, size, {}, trace_id);
+        }
         return raster_area;
     }
 
