@@ -2441,6 +2441,13 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
+        // A write can download GPU-owned bytes elsewhere on its pages. Protect the other
+        // writes in this batch before that download can overwrite them.
+        if (sequences.size() > 1) {
+            for (const auto& [addr, size] : sequences) {
+                buffer_cache.ClaimCpuWrite(addr, size);
+            }
+        }
         for (const auto& [addr, size] : sequences) {
             buffer_cache.WriteMemory(addr, size);
         }
@@ -2476,7 +2483,9 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
     // on its pages (WriteMemory), which would write over the next collected write.
     {
         std::scoped_lock lock{buffer_cache.mutex};
-        buffer_cache.ClaimCpuWrites(ranges);
+        for (const auto& [addr, size] : ranges) {
+            buffer_cache.ClaimCpuWrite(addr, size);
+        }
     }
     for (const auto& [addr, size] : ranges) {
         OnCacheInvalidation(addr, size);

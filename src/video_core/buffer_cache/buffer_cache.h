@@ -1093,12 +1093,10 @@ void BufferCache<P>::PopAsyncFlushes() {
 }
 
 template <class P>
-void BufferCache<P>::ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges) {
-    for (const auto& [device_addr, size] : ranges) {
-        if (IsRegionGpuModified(device_addr, size)) {
-            ClearDownload(device_addr, size);
-            gpu_modified_ranges.Subtract(device_addr, size);
-        }
+void BufferCache<P>::ClaimCpuWrite(DAddr device_addr, u64 size) {
+    if (IsRegionGpuModified(device_addr, size)) {
+        ClearDownload(device_addr, size);
+        gpu_modified_ranges.Subtract(device_addr, size);
     }
 }
 

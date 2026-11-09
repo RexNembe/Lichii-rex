@@ -590,10 +590,7 @@ void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, s
         return;
     }
     WriteBlockImpl(gpu_dest_addr, words, size, VideoCommon::CacheType::None, true);
-    // The accumulator merges word by word differently from one range: keep its ranges.
-    for (std::size_t i = 0; i < count; ++i) {
-        accumulator.Add(gpu_dest_addr + i * sizeof(u32), sizeof(u32));
-    }
+    accumulator.Add(gpu_dest_addr, size);
 }
 
 void MemoryManager::FlushRegion(GPUVAddr gpu_addr, size_t size,

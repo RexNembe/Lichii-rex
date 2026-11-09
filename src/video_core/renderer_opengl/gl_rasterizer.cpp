@@ -576,6 +576,17 @@ void RasterizerOpenGL::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     }
 }
 
+void RasterizerOpenGL::InnerInvalidation(
+    std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    if (sequences.size() > 1 && !Settings::values.skip_cpu_inner_invalidation.GetValue()) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        for (const auto& [addr, size] : sequences) {
+            buffer_cache.ClaimCpuWrite(addr, size);
+        }
+    }
+    RasterizerInterface::InnerInvalidation(sequences);
+}
+
 bool RasterizerOpenGL::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
     {
